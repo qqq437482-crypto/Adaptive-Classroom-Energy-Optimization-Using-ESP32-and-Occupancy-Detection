@@ -1,0 +1,547 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <DHT.h>
+#include <WiFi.h>
+#include <WebServer.h>
+const char* ssid = "Mahmoud";
+const char* password = "***************";
+
+WebServer server(80);
+void handleRoot();
+float tempHistory[20];
+int historyIndex = 0;
+// ================= DHT22 =================
+#define DHTPIN 4
+#define DHTTYPE DHT22
+DHT dht(DHTPIN, DHTTYPE);
+
+// ================= LCD =================
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+    
+// ================= IR =================
+#define IR1 18
+#define IR2 19
+
+// ================= OUTPUTS =================
+#define FAN_PIN    25
+#define RELAY1     26
+#define RELAY2     27
+#define LED_GREEN  32
+#define LED_RED    33
+// ===== PWM FAN =====
+const int FAN_FREQ = 25000;
+const int FAN_RESOLUTION = 8;
+
+// ================= SETTINGS =================
+const int MAX_CLASS = 30;
+const float TEMP_THRESHOLD = 30.0;
+unsigned long lastCountTime = 0;
+const unsigned long COUNT_DELAY = 200;
+// ================= COUNTER =================
+int students = 0;
+int totalEntered = 0;
+int totalExited = 0;
+float occupancy = 0;
+int state = 0;
+unsigned long stateTime = 0;
+const unsigned long TIMEOUT = 3000;
+
+// ================= DHT Backup =================
+float lastTemp = 0;
+float lastHum = 0;
+bool fanEnabled = false;
+void setup() {
+
+  Serial.begin(115200);
+
+  pinMode(IR1, INPUT);
+  pinMode(IR2, INPUT);
+
+  pinMode(FAN_PIN, OUTPUT);
+  pinMode(RELAY1, OUTPUT);
+  pinMode(RELAY2, OUTPUT);
+
+  pinMode(LED_GREEN, OUTPUT);
+  pinMode(LED_RED, OUTPUT);
+
+  // Relay Active LOW
+  digitalWrite(RELAY1, HIGH);
+  digitalWrite(RELAY2, HIGH);
+
+  ledcAttach(FAN_PIN, FAN_FREQ, FAN_RESOLUTION);
+  ledcWrite(FAN_PIN, 0);
+
+  dht.begin();
+
+  lcd.init();
+  lcd.backlight();
+
+  lcd.setCursor(0, 0);
+  lcd.print("SMART CLASS");
+  lcd.setCursor(0, 1);
+  lcd.print("SYSTEM READY");
+  delay(2000);
+
+  lcd.clear();
+
+  Serial.println("Smart Classroom Started");
+  //wep
+  WiFi.begin(ssid, password);
+
+while (WiFi.status() != WL_CONNECTED) {
+  delay(500);
+}
+
+Serial.println(WiFi.localIP());
+server.on("/", handleRoot);
+server.begin();
+
+Serial.println("Web Server Started");
+}
+
+void loop() {
+server.handleClient();
+  // ================= PEOPLE COUNTER =================
+
+  int s1 = digitalRead(IR1);
+  int s2 = digitalRead(IR2);
+
+  switch (state) {
+
+    case 0:
+      if (s1 == LOW) {
+        state = 1;
+        stateTime = millis();
+      }
+      else if (s2 == LOW) {
+        state = 2;
+        stateTime = millis();
+      }
+      break;
+
+    case 1: // دخول
+      if (s2 == LOW) {
+        if (millis() - lastCountTime > COUNT_DELAY) {
+  if (students < MAX_CLASS) {
+    students++;
+    totalEntered++;
+}
+  lastCountTime = millis();
+}
+        state = 3;
+
+        Serial.print("ENTER -> ");
+        Serial.println(students);
+      }
+      break;
+
+    case 2: // خروج
+      if (s1 == LOW) {
+
+        if (students > 0 && millis() - lastCountTime > COUNT_DELAY) {
+  students--;
+  totalExited++;
+  lastCountTime = millis();
+}
+
+        state = 3;
+
+        Serial.print("EXIT -> ");
+        Serial.println(students);
+      }
+      break;
+
+    case 3:
+      if (s1 == HIGH && s2 == HIGH)
+        state = 0;
+      break;
+  }
+
+ if (state != 0 && millis() - stateTime > TIMEOUT) {
+    state = 0;
+}
+students = constrain(students, 0, MAX_CLASS);
+occupancy = (students * 100.0) / MAX_CLASS;
+  // ================= DHT22 =================
+
+  float temp = dht.readTemperature();
+  float hum  = dht.readHumidity();
+
+  if (!isnan(temp)) lastTemp = temp;
+  if (!isnan(hum))  lastHum  = hum;
+  //تخزين بيانات الرسم البيانى
+  static unsigned long graphTimer = 0;
+
+if (millis() - graphTimer > 10000) {
+
+    tempHistory[historyIndex] = lastTemp;
+
+    historyIndex++;
+
+    if (historyIndex >= 20)
+        historyIndex = 0;
+
+    graphTimer = millis();
+}
+
+  // ================= SMART FAN CONTROL =================
+
+// ================= SMART CLIMATE AI =================
+
+int speedPWM = 0;
+
+float tempScore = map((int)(lastTemp * 10), 220, 400, 0, 50);
+tempScore = constrain(tempScore, 0, 50);
+
+float crowdScore = map(students, 0, MAX_CLASS, 0, 35);
+crowdScore = constrain(crowdScore, 0, 35);
+
+float humScore = map((int)lastHum, 30, 80, 0, 15);
+humScore = constrain(humScore, 0, 15);
+
+float comfortIndex = tempScore + crowdScore + humScore;
+comfortIndex = constrain(comfortIndex, 0, 100);
+
+String classState;
+
+if (comfortIndex < 35)
+    classState = "COMFORT";
+
+else if (comfortIndex < 70)
+    classState = "WARM";
+
+else
+    classState = "HOT";
+
+if (students == 0)
+{
+    speedPWM = 0;
+}
+else
+{
+    speedPWM = map((int)comfortIndex, 0, 100, 120, 255);
+}
+
+ledcWrite(FAN_PIN, speedPWM);
+
+bool fanOn = (speedPWM > 0);
+
+int speedPercent = map(speedPWM, 0, 255, 0, 100);
+
+digitalWrite(RELAY1, fanOn ? LOW : HIGH);
+digitalWrite(RELAY2, students > 0 ? LOW : HIGH);
+
+if (students == 0) {
+
+    digitalWrite(LED_RED, LOW);
+    digitalWrite(LED_GREEN, LOW);
+
+}
+else if (students >= MAX_CLASS) {
+
+    digitalWrite(LED_RED, HIGH);
+    digitalWrite(LED_GREEN, LOW);
+
+}
+else {
+
+    digitalWrite(LED_RED, LOW);
+    digitalWrite(LED_GREEN, HIGH);
+
+}
+  // ================= LCD DISPLAY =================
+
+  if (students == 0) {
+
+    lcd.setCursor(0, 0);
+    lcd.print("CLASS EMPTY    ");
+
+    lcd.setCursor(0, 1);
+    lcd.print("Saving Power   ");
+  }
+
+  else if (students >= MAX_CLASS) {
+
+    lcd.setCursor(0, 0);
+    lcd.print("!!! FULL !!!   ");
+
+    lcd.setCursor(0, 1);
+    lcd.print("Students:");
+    lcd.print(students);
+    lcd.print(" ");
+  }
+
+  else {
+    lcd.setCursor(0,0);
+lcd.print("                ");
+lcd.setCursor(0,0);
+    lcd.setCursor(0, 0);
+    lcd.print("S:");
+    lcd.print(students);
+    lcd.print(" T:");
+    lcd.print(lastTemp, 1);
+    lcd.print("   ");
+    lcd.setCursor(0, 1);
+lcd.print("                ");
+lcd.setCursor(0,1);
+    lcd.print("H:");
+    lcd.print(lastHum, 0);
+    lcd.print("% ");
+
+   if (fanOn) {
+  lcd.print("SPD:");
+lcd.print(speedPercent);
+  lcd.print("%");
+}
+else {
+  lcd.print("SPD:0%");
+ }
+}
+// ================= SERIAL =================
+
+  Serial.print("Students: ");
+  Serial.print(students);
+
+  Serial.print(" | Temp: ");
+  Serial.print(lastTemp);
+
+  Serial.print(" C | Hum: ");
+  Serial.print(lastHum);
+
+  Serial.print("% | Fan: ");
+  Serial.print(fanOn ? "ON" : "OFF");
+
+  Serial.print(" | In: ");
+  Serial.print(totalEntered);
+
+  Serial.print(" | Out: ");
+  Serial.print(totalExited);
+Serial.print(" | Occupancy: ");
+Serial.print(occupancy);
+Serial.print("%");
+Serial.print(" | Status: ");
+
+if (occupancy < 30)
+    Serial.print("LOW");
+else if (occupancy < 70)
+    Serial.print("MEDIUM");
+else
+    Serial.print("HIGH");
+  Serial.print(" | Speed: ");
+Serial.print(speedPercent);
+Serial.println("%");
+//Serial.print(" | Saved Min: ");
+//Serial.print(totalSavedTime / 60000);
+ }
+ void handleRoot() {
+
+String statusText = "LOW";
+String statusColor = "#22c55e";
+
+if (occupancy >= 70) {
+    statusText = "HIGH";
+    statusColor = "#ef4444";
+}
+else if (occupancy >= 30) {
+    statusText = "MEDIUM";
+    statusColor = "#f59e0b";
+}
+
+String fanStatus = (digitalRead(RELAY1) == LOW) ? "ON" : "OFF";
+
+String page = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+
+<meta charset="UTF-8">
+<meta http-equiv="refresh" content="3">
+
+<title>Smart Classroom Dashboard</title>
+
+<style>
+
+*{
+margin:0;
+padding:0;
+box-sizing:border-box;
+font-family:'Segoe UI',sans-serif;
+}
+
+body{
+background:linear-gradient(135deg,#0f172a,#1e293b);
+color:white;
+padding:20px;
+}
+
+.header{
+text-align:center;
+margin-bottom:25px;
+}
+
+.header h1{
+font-size:38px;
+color:#38bdf8;
+}
+
+.grid{
+display:grid;
+grid-template-columns:repeat(auto-fit,minmax(250px,1fr));
+gap:20px;
+}
+
+.card{
+background:#1e293b;
+border-radius:20px;
+padding:25px;
+box-shadow:0 0 20px rgba(0,0,0,0.3);
+transition:0.3s;
+}
+
+.card:hover{
+transform:translateY(-5px);
+}
+
+.title{
+font-size:18px;
+color:#94a3b8;
+margin-bottom:10px;
+}
+
+.value{
+font-size:42px;
+font-weight:bold;
+}
+
+.students{
+border-left:6px solid #3b82f6;
+}
+
+.temp{
+border-left:6px solid #ef4444;
+}
+
+.hum{
+border-left:6px solid #06b6d4;
+}
+
+.occ{
+border-left:6px solid #22c55e;
+}
+
+.status{
+margin-top:25px;
+background:#1e293b;
+padding:20px;
+border-radius:20px;
+text-align:center;
+}
+
+.progress{
+width:100%;
+height:30px;
+background:#334155;
+border-radius:20px;
+overflow:hidden;
+margin-top:15px;
+}
+
+.bar{
+height:100%;
+width:%OCC%%;
+background:linear-gradient(90deg,#22c55e,#f59e0b,#ef4444);
+}
+
+.badge{
+display:inline-block;
+padding:10px 20px;
+border-radius:30px;
+font-weight:bold;
+font-size:20px;
+background:%STATUSCOLOR%;
+margin-top:10px;
+}
+
+.fan{
+font-size:28px;
+margin-top:10px;
+color:#38bdf8;
+}
+
+.footer{
+margin-top:25px;
+text-align:center;
+color:#94a3b8;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="header">
+<h1>SMART CLASSROOM</h1>
+<h3>ESP32 Monitoring Dashboard</h3>
+</div>
+
+<div class="grid">
+
+<div class="card students">
+<div class="title">Students</div>
+<div class="value">%STUDENTS%</div>
+</div>
+
+<div class="card temp">
+<div class="title">Temperature</div>
+<div class="value">%TEMP% °C</div>
+</div>
+
+<div class="card hum">
+<div class="title">Humidity</div>
+<div class="value">%HUM% %%</div>
+</div>
+
+<div class="card occ">
+<div class="title">Occupancy</div>
+<div class="value">%OCC% %%</div>
+</div>
+
+</div>
+
+<div class="status">
+
+<h2>Classroom Status</h2>
+
+<div class="badge">
+%STATUS%
+</div>
+
+<div class="progress">
+<div class="bar"></div>
+</div>
+
+<div class="fan">
+🌀 Fan : %FAN%
+</div>
+
+</div>
+
+<div class="footer">
+Smart Classroom System © 2026
+</div>
+
+</body>
+</html>
+)rawliteral";
+
+page.replace("%STUDENTS%", String(students));
+page.replace("%TEMP%", String(lastTemp,1));
+page.replace("%HUM%", String(lastHum,0));
+page.replace("%OCC%", String(occupancy,0));
+page.replace("%STATUS%", statusText);
+page.replace("%STATUSCOLOR%", statusColor);
+page.replace("%FAN%", fanStatus);
+
+server.send(200,"text/html",page);
+}
